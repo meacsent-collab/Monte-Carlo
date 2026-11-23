@@ -40,12 +40,17 @@ CONFIG = {
     "start_date": "2020-01-01",
     "end_date": "2024-12-31",
     # Параметри моделювання
-    "n_simulations": 100_000,         # базова кількість сценаріїв
+    "n_simulations": 100_000,         # базова кількість сценаріїв (вебзастосунок)
+    # Кількість сценаріїв для підсумкових таблиць курсової — обрана за правилом
+    # зупинки (для розподілу Стьюдента CVaR стабілізується лише з N ≈ 1 000 000)
+    "n_simulations_report": 1_000_000,
     "seed": 42,                        # seed генератора (відтворюваність)
     "holding_periods": [1, 10],        # горизонти в торгових днях
     "confidence_levels": [0.95, 0.99], # рівні довіри для VaR/CVaR
     # Параметри розподілу Стьюдента
-    "student_df": 12,                  # ступені свободи ν (задано вручну)
+    # Оцінено методом максимальної правдоподібності за денними дохідностями
+    # портфеля (estimate_student_df): ν̂ ≈ 3,83 → округлено до 4
+    "student_df": 4,
     # Параметри стрес-сценарію
     "stress_target_corr": 0.90,        # цільова кореляція між ризиковими активами
     "stress_vol_multiplier": 1.50,     # множник волатильності
@@ -53,7 +58,8 @@ CONFIG = {
     "sensitivity_vol_multipliers": [0.8, 1.0, 1.2, 1.5],
     # Сітка N для аналізу збіжності
     "convergence_n_grid": [1_000, 2_000, 5_000, 10_000, 20_000,
-                            50_000, 100_000, 200_000, 500_000],
+                            50_000, 100_000, 200_000, 500_000,
+                            1_000_000, 2_000_000],
     "convergence_threshold": 0.01,     # правило зупинки: < 1 %
     # Кількість торгових днів у році (для річної ануалізації)
     "trading_days_per_year": 252,
@@ -300,17 +306,23 @@ def simulate_student(
     cov: np.ndarray,
     n_sim: int,
     holding_period: int,
-    df: int = 12,
+    df: int = 4,
     seed: int = 42,
 ) -> np.ndarray:
     """
     Генерує N сценаріїв кумулятивної лог-дохідності за h днів
     з багатовимірного розподілу Стьюдента (важкі хвости).
 
-    Масштабування: щоб коваріація t-розподілу збігалася з Σ,
-    ділимо стандартний t на sqrt(ν/(ν-2)):
-        t_scaled = t_raw / sqrt(ν/(ν-2))
-        Cov(t_scaled) = Σ  ✓
+    Алгоритм (багатовимірний t-розподіл):
+      1. Z = ε · Lᵀ, ε ~ N(0, I) — корельований нормальний вектор
+      2. W ~ χ²(ν) — одна спільна величина для всіх активів у сценарії
+      3. R = μ·h + Z · sqrt((ν − 2) / W)
+
+    Множник sqrt((ν − 2)/W) робить коваріацію сценаріїв рівною Σ·h
+    (бо E[(ν − 2)/W] = 1), тож порівняння з нормальним розподілом
+    відбувається за однакової волатильності — відрізняються лише хвости.
+    Спільний W означає, що екстремальні значення в активах настають
+    одночасно (хвостова залежність), як це буває в кризу.
 
     Parameters
     ----------
@@ -334,13 +346,35 @@ def simulate_student(
 
     rng = np.random.default_rng(seed)
     n_assets = len(mu)
-    # Генеруємо некорельований t-шум
-    t_raw = rng.standard_t(df=df, size=(n_sim, n_assets))
-    # Масштабуємо: щоб Cov(ε) = I → Cov(corr_sim) = cov_h
-    scale = np.sqrt((df - 2) / df)
-    t_scaled = t_raw / scale
-    returns_sim = mu_h + t_scaled @ L.T
+    eps = rng.standard_normal((n_sim, n_assets))     # ε ~ N(0, I)
+    z = eps @ L.T                                    # Cov(z) = cov_h
+    w_chi2 = rng.chisquare(df, size=n_sim)           # W ~ χ²(ν)
+    scale = np.sqrt((df - 2) / w_chi2)[:, None]      # E[scale²] = 1
+    returns_sim = mu_h + z * scale
     return returns_sim
+
+
+def estimate_student_df(
+    returns: pd.DataFrame,
+    weights: np.ndarray,
+) -> float:
+    """
+    Оцінює кількість ступенів свободи ν розподілу Стьюдента методом
+    максимальної правдоподібності за денними дохідностями портфеля.
+
+    Parameters
+    ----------
+    returns : DataFrame денних лог-дохідностей активів
+    weights : ваги активів
+
+    Returns
+    -------
+    nu_hat : оцінка ν
+    """
+    w = portfolio_weights_valid(list(weights))
+    r_port = np.log(np.exp(returns.values) @ w)
+    nu_hat, _, _ = stats.t.fit(r_port)
+    return float(nu_hat)
 
 
 def portfolio_losses(
@@ -565,8 +599,9 @@ def convergence_study(
     """
     Вивчає збіжність оцінки CVaR залежно від кількості сценаріїв N.
 
-    Правило зупинки: N достатнє, якщо
-        |CVaR(2N) − CVaR(N)| / |CVaR(N)| < threshold (1 %)
+    Правило зупинки: N* — найменше N сітки, починаючи з якого відносна
+    зміна CVaR між сусідніми значеннями сітки стабільно менша за threshold:
+        |CVaR(N_k) − CVaR(N_{k−1})| / |CVaR(N_{k−1})| < 1 % для всіх k ≥ k*
 
     Parameters
     ----------
@@ -579,7 +614,6 @@ def convergence_study(
     """
     rows = []
     cvar_prev_n, cvar_prev_s = None, None
-    min_n_norm, min_n_stud = None, None
 
     for n in n_grid:
         sim_n = simulate_normal(mu, cov, n, holding_period, seed)
@@ -593,11 +627,6 @@ def convergence_study(
         rel_n = abs(cvar_n - cvar_prev_n) / abs(cvar_prev_n) if cvar_prev_n else None
         rel_s = abs(cvar_s - cvar_prev_s) / abs(cvar_prev_s) if cvar_prev_s else None
 
-        if rel_n is not None and rel_n < threshold and min_n_norm is None:
-            min_n_norm = n
-        if rel_s is not None and rel_s < threshold and min_n_stud is None:
-            min_n_stud = n
-
         rows.append({
             "N": n,
             "CVaR (нормальний)": round(cvar_n, 2),
@@ -608,6 +637,18 @@ def convergence_study(
         cvar_prev_n, cvar_prev_s = cvar_n, cvar_s
 
     df = pd.DataFrame(rows)
+
+    def _stable_from(col: str):
+        """Найменше N, починаючи з якого ВСІ подальші відносні зміни < threshold."""
+        changes = df[col].tolist()
+        for i in range(1, len(changes)):
+            tail = changes[i:]
+            if all(c is not None and not pd.isna(c) and c < threshold for c in tail):
+                return int(df["N"].iloc[i])
+        return None
+
+    min_n_norm = _stable_from("Відн. зміна (норм.)")
+    min_n_stud = _stable_from("Відн. зміна (Стьюд.)")
     df.attrs["min_n_normal"] = min_n_norm
     df.attrs["min_n_student"] = min_n_stud
     return df
@@ -979,7 +1020,7 @@ def plot_correlation_heatmap(
     """
     Будує теплову карту кореляційної матриці дохідностей.
 
-    Рис. 2.1 курсової роботи.
+    Рис. 2.2 курсової роботи.
 
     Parameters
     ----------
@@ -1010,7 +1051,7 @@ def plot_correlation_heatmap(
                     ha="center", va="center", fontsize=10,
                     color="black" if abs(corr.values[i, j]) < 0.7 else "white")
 
-    ax.set_title("Рис. 2.1 – Кореляційна матриця денних лог-дохідностей", fontsize=12, pad=12)
+    ax.set_title("Рис. 2.2 – Кореляційна матриця денних лог-дохідностей", fontsize=12, pad=12)
     fig.tight_layout()
 
     if save_path:
@@ -1071,7 +1112,7 @@ def plot_returns_hist_qq(
         ax_qq.set_ylabel("Вибіркові квантилі", fontsize=10)
 
     fig.suptitle(
-        "Рис. 2.2 – Розподіл денних дохідностей: гістограми та QQ-графіки",
+        "Рис. 2.1 – Розподіл денних дохідностей: гістограми та QQ-графіки",
         fontsize=12, y=1.01
     )
     fig.tight_layout()
@@ -1109,14 +1150,21 @@ def plot_loss_distribution(
     Figure matplotlib
     """
     _setup_matplotlib_ukrainian()
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=False)
-    titles = ["Нормальний розподіл", "Розподіл Стьюдента (ν=12)"]
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+    titles = ["Нормальний розподіл", f"Розподіл Стьюдента (ν={CONFIG['student_df']})"]
     colors_line = {0.95: ("navy", "cornflowerblue"),
                    0.99: ("darkred", "salmon")}
 
+    # Спільний діапазон осі X для обох панелей (0,05–99,95 перцентилі),
+    # щоб поодинокі екстремальні сценарії t-розподілу не стискали графік
+    both = np.concatenate([losses_normal, losses_student])
+    x_lo, x_hi = np.quantile(both, [0.0005, 0.9995])
+    bins = np.linspace(x_lo, x_hi, 121)
+
     for ax, losses, title in zip(axes, [losses_normal, losses_student], titles):
-        ax.hist(losses, bins=120, density=True, color="steelblue",
-                alpha=0.5, edgecolor="none", label="Збитки")
+        ax.hist(losses[(losses >= x_lo) & (losses <= x_hi)], bins=bins, density=True,
+                color="steelblue", alpha=0.5, edgecolor="none", label="Збитки")
+        ax.set_xlim(x_lo, x_hi)
 
         for alpha in confidence_levels:
             var, cvar = compute_var_cvar(losses, alpha)
@@ -1168,7 +1216,7 @@ def plot_convergence(
     ax.plot(conv_df["N"], conv_df["CVaR (нормальний)"],
             "o-", color="steelblue", lw=1.8, ms=6, label="Нормальний")
     ax.plot(conv_df["N"], conv_df["CVaR (Стьюдент)"],
-            "s-", color="tomato", lw=1.8, ms=6, label="Стьюдент (ν=12)")
+            "s-", color="tomato", lw=1.8, ms=6, label=f"Стьюдент (ν={CONFIG['student_df']})")
 
     # Позначити мінімальне достатнє N
     min_n_n = conv_df.attrs.get("min_n_normal")
@@ -1182,6 +1230,9 @@ def plot_convergence(
     if min_n_s:
         row = conv_df[conv_df["N"] == min_n_s].iloc[0]
         ax.axvline(min_n_s, color="tomato", ls=":", lw=1.2, alpha=0.7)
+        ax.annotate(f"N*={min_n_s:,}", xy=(min_n_s, row["CVaR (Стьюдент)"]),
+                    xytext=(min_n_s * 0.25, row["CVaR (Стьюдент)"] * 1.05),
+                    fontsize=9, color="tomato", arrowprops=dict(arrowstyle="->", color="tomato"))
 
     ax.set_xscale("log")
     ax.set_xlabel("Кількість сценаріїв N (лог. шкала)", fontsize=11)
@@ -1226,7 +1277,7 @@ def plot_sensitivity(
     ax.plot(sens_df["Множник σ"], sens_df["CVaR (норм., $)"],
             "o-", color="steelblue", lw=1.8, ms=7, label="Нормальний")
     ax.plot(sens_df["Множник σ"], sens_df["CVaR (Стьюд., $)"],
-            "s-", color="tomato", lw=1.8, ms=7, label="Стьюдент (ν=12)")
+            "s-", color="tomato", lw=1.8, ms=7, label=f"Стьюдент (ν={CONFIG['student_df']})")
 
     ax.axvline(1.0, color="gray", ls=":", lw=1.2, label="Базовий рівень")
     ax.set_xlabel("Множник волатильності", fontsize=11)
